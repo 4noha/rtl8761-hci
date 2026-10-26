@@ -1,0 +1,4 @@
+pyusb>=1.2
+pytest>=7
+# optional: faster SMP crypto backend; a pure-Python fallback is used without it
+# cryptography>=41
