@@ -171,3 +171,21 @@ is not implemented).
    SC-only key-size policy beyond `min_key_size`.
 7. The crypto was validated against published vectors. It is not constant-time (pure-Python
    P-256), which is acceptable for a test tool but not for anything security-critical.
+
+## Verifying that the peer quirks are required (measured)
+
+A commercial peripheral (LE Secure Connections, Just Works, no MITM) was used to check each
+quirk in isolation. Every run started from a fresh pairing; "bond" means the peer distributed
+its own keys after encryption.
+
+| confirm | eager encryption | keys first | result |
+| --- | --- | --- | --- |
+| spec (`f4(own_x, own_y, ...)`) | – | – | peer sent **Pairing Failed 0x04 (Confirm Value Failed)** |
+| crossed X (`f4(own_x, peer_x, ...)`) | no | no | peer never sent its DHKey Check; 30 s SMP timeout |
+| crossed X | yes | no | encrypted, but **no bond** (peer never distributed keys) |
+| crossed X | yes | yes | **bond** established |
+
+Conclusion: for this peer all of `SMP_F4_XCROSS`, `SMP_EAGER_ENCRYPT` and `SMP_KEYS_FIRST` are
+required, not cargo cult. `SMP_DIST_LTK` is also needed because the peer asks for ENC keys even
+in Secure Connections. Keep the flags opt-in and re-measure per device; a spec-compliant peer
+rejects the crossed-X confirm immediately, which is the cheapest way to tell the two apart.
