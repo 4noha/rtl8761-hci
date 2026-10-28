@@ -322,8 +322,10 @@ class Hci:
         self.handlers: list[Callable[[Event], None]] = []
         self.acl_handlers: list[Callable[[bytes], None]] = []
         self.acl_credits: Optional[int] = None
+        self.acl_credits_max: int = 0
         self.acl_mtu = 0
         self.le_acl_credits: Optional[int] = None
+        self.le_acl_credits_max: int = 0
         # Handles that were ever LE: completion events for a just-dropped handle must still
         # go back to the LE credit pool, not the BR/EDR one.
         self.le_known_handles: set[int] = set()
@@ -355,8 +357,19 @@ class Hci:
             self.le_conns[ev.fields["handle"]] = {k: ev.fields[k] for k in (
                 "role", "peer_addr", "peer_addr_type")}
         if ev.code == EVT.DISCONNECTION_COMPLETE:
-            self.le_handles.discard(ev.fields.get("handle"))
-            self.le_conns.pop(ev.fields.get("handle"), None)
+            handle = ev.fields.get("handle")
+            # The controller discards queued ACL data for a dropped link without
+            # completing it, so any credit held by in-flight fragments is gone.
+            # Reclaim it here or a reconnect loop starves after a few aborts.
+            pending = self.inflight.pop(handle, 0)
+            if pending:
+                if handle in self.le_known_handles and self.le_acl_credits is not None:
+                    self.le_acl_credits = min(self.le_acl_credits + pending,
+                                              self.le_acl_credits_max)
+                elif self.acl_credits is not None:
+                    self.acl_credits = min(self.acl_credits + pending, self.acl_credits_max)
+            self.le_handles.discard(handle)
+            self.le_conns.pop(handle, None)
         if ev.code == EVT.HARDWARE_ERROR:
             log.error("controller hardware error 0x%02x", ev.fields["hw_code"])
         for h in self.handlers:
@@ -457,6 +470,7 @@ class Hci:
         r = self.command(OP.READ_BUFFER_SIZE).fields["ret"]
         _, al, sl, an, sn = struct.unpack("<BHBHH", r[:8])
         self.acl_mtu, self.acl_credits = al, an
+        self.acl_credits_max = an
         return BufferSize(al, sl, an, sn)
 
     def le_read_buffer_size(self) -> tuple[int, int]:
@@ -464,8 +478,10 @@ class Hci:
         _, ln, num = struct.unpack("<BHB", r[:4])
         if ln == 0:  # shared with BR/EDR buffers
             self.le_acl_mtu, self.le_acl_credits = self.acl_mtu, None
+            self.le_acl_credits_max = 0
         else:
             self.le_acl_mtu, self.le_acl_credits = ln, num
+            self.le_acl_credits_max = num
         return ln, num
 
     def read_local_name(self) -> str:
