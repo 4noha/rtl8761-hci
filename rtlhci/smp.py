@@ -140,8 +140,12 @@ class SmpConfig:
     keypress: bool = False
     max_key_size: int = 16
     min_key_size: int = 7
-    init_key_dist: int = KD_ENC | KD_ID | KD_SIGN   # keys we want the initiator to send
-    resp_key_dist: int = KD_ENC | KD_ID | KD_SIGN   # keys we want the responder to send
+    # Keys we want each side to distribute. SMP_KD=<n> overrides both with a raw bitmask
+    # (1=ENC, 2=ID, 4=SIGN). Some peers stall when asked for a CSRK, so 3 is a useful value.
+    init_key_dist: int = field(
+        default_factory=lambda: int(os.environ.get("SMP_KD", "0"), 0) or (KD_ENC | KD_ID | KD_SIGN))
+    resp_key_dist: int = field(
+        default_factory=lambda: int(os.environ.get("SMP_KD", "0"), 0) or (KD_ENC | KD_ID | KD_SIGN))
     accept_pairing: bool = True    # as peripheral: answer Pairing Request at all
     sc_debug_keys: bool = False    # use the spec debug P-256 key pair (sniffer-decryptable)
     # Peer quirk (observed on one commercial peripheral): the confirm is computed as
@@ -161,6 +165,11 @@ class SmpConfig:
         default_factory=lambda: os.environ.get("SMP_EAGER_ENCRYPT") == "1")
     f4_xcross: bool = field(
         default_factory=lambda: os.environ.get("SMP_F4_XCROSS") == "1")
+    # Peer quirk (observed): one device stalls after the initiator's Pairing Confirm and never
+    # sends its DHKey Check / keys, but completes normally when the initiator skips its own
+    # confirm and sends the random directly. SMP_SKIP_CONFIRM=1.
+    skip_confirm: bool = field(
+        default_factory=lambda: os.environ.get("SMP_SKIP_CONFIRM") == "1")
     timeout_s: float = TIMEOUT_S
 
 
@@ -809,7 +818,10 @@ class Smp:
                 self._sc_send_cai(s)
             s.state, s.expect = _S.WAIT_CONFIRM, {CODE.PAIRING_CONFIRM} | self._kp(s)
         elif s.initiator:   # JW/NC: send Ca = f4(PKax, PKay, Na, 0) before waiting for Cb
-            self._sc_send_cai(s)
+            if self.cfg.skip_confirm:
+                s.na = self._rand(16)
+            else:
+                self._sc_send_cai(s)
             s.state, s.expect = _S.WAIT_CONFIRM, {CODE.PAIRING_CONFIRM}
         else:   # responder JW/NC: send Cb = f4(PKbx, PKax, Nb, 0)
             s.nb = self._rand(16)
