@@ -118,6 +118,9 @@ smp.pair(handle)            # central: Pairing Request; peripheral: Security Req
 hci.pump()                  # PDUs are handled in pump(); HCI encryption commands run from its tick
 smp.results[handle]         # PairingResult(success, reason, sc, method, key_size, keys...)
 smp.encrypt(handle)         # later: re-encrypt from the stored bond (central)
+smp.save_bonds("bonds.json")        # mode 0600; merges on load
+smp.load_bonds("bonds.json")
+smp.pairing_blocked_for(peer)       # seconds left of the Repeated Attempts back-off
 ```
 
 Status:
@@ -127,10 +130,13 @@ Status:
   Strict PDU validation: malformed or out-of-order input gets Pairing Failed and never raises.
 * The crypto matches the spec sample data (c1, s1, ah, f4, f5, f6, g2, h6, P-256 ECDH, debug keys)
   on both the pure-Python backend and the `cryptography` backend.
+* Bond storage: `smp.bonds` (in memory) plus `save_bonds()` / `load_bonds()` (JSON, mode 0600).
+* Repeated Attempts (Core 3.4): `SmpConfig(repeated_attempts_limit=N,
+  repeated_attempts_backoff_s=S)` refuses new pairings for S seconds after N consecutive
+  failures with the same peer (disabled by default).
 * Not implemented: OOB (answered with OOB Not Available), cross-transport key derivation
   (BR/EDR SMP on CID 0x0007 is refused with Pairing Not Supported), RPA generation/resolution,
-  signed writes using the CSRK, Repeated Attempts back-off, persistent bond storage (bonds are in
-  memory: `smp.bonds`). The own address is assumed to be the public address.
+  signed writes using the CSRK. The own address is assumed to be the public address.
 * All of this is tested only against `FakeSmpPeer` (an independent software peer). Real-device
   behaviour varies; several quirks found on hardware are selectable with `SMP_*` environment
   variables (see `docs/SMP-DESIGN.md`). Do not fuzz hardware you do not own or have permission
