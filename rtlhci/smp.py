@@ -23,6 +23,7 @@ so we never nest Hci.command() inside an event handler.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import struct
@@ -170,6 +171,12 @@ class SmpConfig:
     # confirm and sends the random directly. SMP_SKIP_CONFIRM=1.
     skip_confirm: bool = field(
         default_factory=lambda: os.environ.get("SMP_SKIP_CONFIRM") == "1")
+    # Repeated Attempts (Core 3.4): after `limit` consecutive failures for one peer,
+    # refuse new pairings for `backoff_s`.  0 disables the check (legacy behaviour).
+    repeated_attempts_limit: int = field(
+        default_factory=lambda: int(os.environ.get("SMP_REPEAT_LIMIT", "0")))
+    repeated_attempts_backoff_s: float = field(
+        default_factory=lambda: float(os.environ.get("SMP_REPEAT_BACKOFF_S", "30")))
     timeout_s: float = TIMEOUT_S
 
 
@@ -201,6 +208,10 @@ class KeySet:
     csrk: Optional[bytes] = None
 
 
+def _hex(v):
+    return v.hex() if isinstance(v, (bytes, bytearray)) else v
+
+
 @dataclass
 class Bond:
     peer: tuple[str, int]
@@ -210,6 +221,46 @@ class Bond:
     ltk: Optional[bytes]          # SC: derived LTK (EDIV=0, Rand=0)
     local: KeySet = field(default_factory=KeySet)   # keys we distributed
     remote: KeySet = field(default_factory=KeySet)  # keys the peer distributed
+
+    def to_dict(self) -> dict:
+        return {
+            "peer": list(self.peer),
+            "sc": self.sc,
+            "authenticated": self.authenticated,
+            "key_size": self.key_size,
+            "ltk": _hex(self.ltk),
+            "local": _keyset_dict(self.local),
+            "remote": _keyset_dict(self.remote),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Bond":
+        peer = (str(d["peer"][0]), int(d["peer"][1]))
+        return cls(peer, bool(d.get("sc", True)), bool(d.get("authenticated", False)),
+                   int(d.get("key_size", 16)),
+                   bytes.fromhex(d["ltk"]) if d.get("ltk") else None,
+                   _keyset_from(d.get("local") or {}),
+                   _keyset_from(d.get("remote") or {}))
+
+
+def _keyset_dict(k: KeySet) -> dict:
+    return {
+        "ltk": _hex(k.ltk),
+        "ediv": k.ediv,
+        "rand": _hex(k.rand),
+        "irk": _hex(k.irk),
+        "identity_addr": _hex(k.identity_addr),
+        "identity_addr_type": k.identity_addr_type,
+        "csrk": _hex(k.csrk),
+    }
+
+
+def _keyset_from(d: dict) -> KeySet:
+    def hx(name):
+        v = d.get(name)
+        return bytes.fromhex(v) if isinstance(v, str) and v else None
+    return KeySet(hx("ltk"), d.get("ediv"), hx("rand"), hx("irk"),
+                  hx("identity_addr"), d.get("identity_addr_type"), hx("csrk"))
 
 
 @dataclass
@@ -361,6 +412,8 @@ class Smp:
         self.results: dict[int, PairingResult] = {}
         self.history: list[PairingResult] = []
         self.bonds: dict[tuple[str, int], Bond] = {}
+        # peer -> (consecutive failures, blocked-until timestamp)
+        self._failures: dict[tuple[str, int], tuple[int, float]] = {}
         self.on_complete: list[Callable[[PairingResult], None]] = []
         self.encrypted: set[int] = set()
         self.errors = 0          # exceptions caught inside handlers (should stay 0)
@@ -378,6 +431,12 @@ class Smp:
         if conn is None:
             raise ValueError(f"handle 0x{handle:03x} is not an LE connection")
         if conn["role"] == 0:
+            peer = (conn["peer_addr"], conn["peer_addr_type"])
+            wait = self.pairing_blocked_for(peer)
+            if wait > 0:
+                log.warning("handle 0x%03x: pairing refused for %.1fs (repeated attempts)",
+                            handle, wait)
+                return False
             s = self._new_session(handle, initiator=True)
             s.preq = build_pairing(CODE.PAIRING_REQUEST, self.cfg.io_cap, 0, self._local_auth(),
                                    self.cfg.max_key_size, self.cfg.init_key_dist & 0x07,
@@ -388,6 +447,46 @@ class Smp:
             s = self._new_session(handle, initiator=False)
             s.state, s.expect = _S.WAIT_REQ, {CODE.PAIRING_REQUEST}
             self._send(s, bytes([CODE.SECURITY_REQUEST, self._local_auth()]))
+
+    # ---------------------------------------------------------------- bonds
+    def pairing_blocked_for(self, peer: tuple[str, int]) -> float:
+        """Seconds left on the Repeated Attempts back-off for this peer."""
+        count, until = self._failures.get(peer, (0, 0.0))
+        if self.cfg.repeated_attempts_limit <= 0 or count < self.cfg.repeated_attempts_limit:
+            return 0.0
+        return max(0.0, until - self.clock())
+
+    def note_pairing_failure(self, peer: tuple[str, int]) -> None:
+        """Record one failed pairing attempt (drives the back-off)."""
+        count, _until = self._failures.get(peer, (0, 0.0))
+        count += 1
+        until = self.clock() + self.cfg.repeated_attempts_backoff_s
+        self._failures[peer] = (count, until)
+
+    def note_pairing_success(self, peer: tuple[str, int]) -> None:
+        self._failures.pop(peer, None)
+
+    def save_bonds(self, path: str, mode: int = 0o600) -> int:
+        """Persist bonds to JSON (mode 0600).  Returns the number written."""
+        data = {"version": 1, "bonds": [b.to_dict() for b in self.bonds.values()]}
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        return len(data["bonds"])
+
+    def load_bonds(self, path: str) -> int:
+        """Merge bonds from JSON.  Returns the number loaded."""
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        n = 0
+        for d in data.get("bonds", []):
+            bond = Bond.from_dict(d)
+            self.bonds[bond.peer] = bond
+            n += 1
+        return n
 
     def encrypt(self, handle: int) -> None:
         """Central: start encryption with a stored bond (no pairing)."""
@@ -475,6 +574,11 @@ class Smp:
                             s.local_keys, s.remote_keys)
                 self.bonds[s.peer] = bond
                 r.bonded = True
+        if r.success:
+            if s.peer != ("", 0):
+                self.note_pairing_success(s.peer)
+        elif s.peer != ("", 0):
+            self.note_pairing_failure(s.peer)
         self.results[s.handle] = r
         self.history.append(r)
         log.info("%s", r)
