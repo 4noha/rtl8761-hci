@@ -324,6 +324,9 @@ class Hci:
         self.acl_credits: Optional[int] = None
         self.acl_mtu = 0
         self.le_acl_credits: Optional[int] = None
+        # Handles that were ever LE: completion events for a just-dropped handle must still
+        # go back to the LE credit pool, not the BR/EDR one.
+        self.le_known_handles: set[int] = set()
         self.le_acl_mtu = 0
         self.inflight: dict[int, int] = {}  # handle -> packets in flight
         self.le_handles: set[int] = set()
@@ -340,7 +343,7 @@ class Hci:
             for h, n in ev.fields["completed"]:
                 h &= 0x0FFF
                 self.inflight[h] = max(0, self.inflight.get(h, 0) - n)
-                if h in self.le_handles and self.le_acl_credits is not None:
+                if h in self.le_known_handles and self.le_acl_credits is not None:
                     self.le_acl_credits += n
                 elif self.acl_credits is not None:
                     self.acl_credits += n
@@ -348,6 +351,7 @@ class Hci:
                 LE_SUB.CONNECTION_COMPLETE, LE_SUB.ENHANCED_CONNECTION_COMPLETE) \
                 and ev.fields.get("status") == 0:
             self.le_handles.add(ev.fields["handle"])
+            self.le_known_handles.add(ev.fields["handle"])
             self.le_conns[ev.fields["handle"]] = {k: ev.fields[k] for k in (
                 "role", "peer_addr", "peer_addr_type")}
         if ev.code == EVT.DISCONNECTION_COMPLETE:
