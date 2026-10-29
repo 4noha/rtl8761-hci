@@ -146,10 +146,21 @@ class L2cap:
         self.cid_handlers: dict[int, Callable[[int, bytes], None]] = {}
         self.ident = 0
         self.unhandled: list[tuple[int, int, bytes]] = []
+        self.sig_rsp: dict[int, tuple[int, bytes]] = {}
+        self.next_cid = 0x0040
+        self.cid_map: dict[int, int] = {}
         hci.acl_handlers.append(self.rx.feed)
 
+    def alloc_cid(self) -> int:
+        cid = self.next_cid
+        self.next_cid += 2
+        if self.next_cid > 0xFFFD:
+            raise RuntimeError("out of dynamic CIDs")
+        return cid
+
     def next_ident(self) -> int:
-        self.ident = self.ident % 255 + 1
+        # 相手（ANWStack）は 0x4a 付近を使うため、自局は 128..255 に寄せる
+        self.ident = (self.ident + 1) % 128 + 128
         return self.ident
 
     def send(self, handle: int, cid: int, payload: bytes) -> None:
@@ -157,6 +168,50 @@ class L2cap:
         mtu = (self.hci.le_acl_mtu if le else 0) or self.hci.acl_mtu
         for pkt in fragment_l2cap(handle, cid, payload, mtu, le):
             self.hci.send_acl_packet(pkt, handle)
+
+    def connect_psm(self, handle: int, psm: int, timeout: float = 6.0) -> int:
+        """BR/EDR の動的チャネルを開く（SDP=0x0001, RFCOMM=0x0003）。dcid を返す。"""
+        import time as _time
+        scid = self.alloc_cid()
+        ident = self.next_ident()
+        self.send(handle, CID_SIGNALING,
+                  build_sig(SIG.CONNECTION_REQ, ident, struct.pack("<HH", psm, scid)))
+        end = _time.monotonic() + timeout
+        dcid = None
+        while _time.monotonic() < end:
+            if ident in self.sig_rsp:
+                code, data = self.sig_rsp.pop(ident)
+                dcid, scid_peer, result, _status = struct.unpack_from("<HHHH", data)
+                if result != 0:
+                    raise RuntimeError(f"L2CAP connect refused result={result:#06x}")
+                self.cid_map[dcid] = scid
+                break
+            self.hci.pump(50)
+        if dcid is None:
+            raise TimeoutError("L2CAP connection response timeout")
+        # ANWStack は CONFIGURE_REQ を signaling CID で送ることを要求する（実測）。
+        # options 無しが通ったので、それを第一候補にする。
+        candidates = [
+            (CID_SIGNALING, b""),
+            (CID_SIGNALING, b"\x01\x02\xa0\x02"),
+            (dcid, b"\x01\x02\xa0\x02"),
+        ]
+        per = max(1.5, timeout / len(candidates))
+        for target_cid, opts in candidates:
+            ident = self.next_ident()
+            self.send(handle, target_cid,
+                      build_sig(SIG.CONFIGURE_REQ, ident,
+                                struct.pack("<HH", dcid, 0) + opts))
+            end = _time.monotonic() + per
+            while _time.monotonic() < end:
+                if ident in self.sig_rsp:
+                    _code, data = self.sig_rsp.pop(ident)
+                    result = struct.unpack_from("<H", data, 4)[0]
+                    if result != 0:
+                        raise RuntimeError(f"L2CAP config failed result={result:#06x}")
+                    return dcid
+                self.hci.pump(50)
+        raise TimeoutError("L2CAP configuration timeout")
 
     def _on_frame(self, handle: int, cid: int, payload: bytes) -> None:
         if cid in self.cid_handlers:
@@ -182,6 +237,23 @@ class L2cap:
             elif code in (SIG.ECHO_RSP, SIG.INFORMATION_RSP, SIG.COMMAND_REJECT,
                           SIG.CONN_PARAM_UPDATE_RSP):
                 self.unhandled.append((handle, cid, build_sig(code, ident, data)))
+                self.sig_rsp[ident] = (code, data)
+            elif code == SIG.CONNECTION_RSP:
+                self.sig_rsp[ident] = (code, data)
+            elif code == SIG.CONFIGURE_REQ:
+                # 応答は scid(2) + flags(2) + result(2) = success
+                dcid = struct.unpack_from("<H", data)[0]
+                scid = self.cid_map.get(dcid, dcid)
+                self.send(handle, cid, build_sig(SIG.CONFIGURE_RSP, ident,
+                                                 struct.pack("<HHH", scid, 0, 0x0000)))
+            elif code == SIG.CONFIGURE_RSP:
+                self.sig_rsp[ident] = (code, data)
+            elif code == SIG.DISCONNECTION_REQ:
+                dcid, scid = struct.unpack_from("<HH", data)
+                self.send(handle, cid, build_sig(SIG.DISCONNECTION_RSP, ident,
+                                                 struct.pack("<HH", dcid, scid)))
+            elif code == SIG.DISCONNECTION_RSP:
+                self.sig_rsp[ident] = (code, data)
             elif code == SIG.CONN_PARAM_UPDATE_REQ and cid == CID_LE_SIGNALING:
                 # accept=0x0000; actual LE Connection Update is left to the caller
                 self.unhandled.append((handle, cid, build_sig(code, ident, data)))
