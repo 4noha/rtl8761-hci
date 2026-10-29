@@ -212,10 +212,12 @@ def _parse_ext_adv_reports(p: bytes) -> list[dict]:
             ad = parse_ad(data); summary = ad_summary(ad)
         except Exception:
             ad, summary = {}, {}
-        out.append(dict(event_type=etype, addr_type=atype, addr=bdaddr_str(addr),
-                        primary_phy=pphy, secondary_phy=sphy, sid=sid, tx_power=txp,
-                        rssi=struct.unpack("b", bytes([rssi]))[0], data=bytes(data), ad=ad,
-                        **summary))
+        rec = dict(event_type=etype, addr_type=atype, addr=bdaddr_str(addr),
+                   primary_phy=pphy, secondary_phy=sphy, sid=sid, tx_power=txp,
+                   rssi=struct.unpack("b", bytes([rssi]))[0], data=bytes(data), ad=ad)
+        for _k, _v in summary.items():
+            rec.setdefault(_k, _v)
+        out.append(rec)
     return out
 
 
