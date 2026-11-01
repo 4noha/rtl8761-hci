@@ -129,7 +129,8 @@ class AttClient:
             except Exception:
                 pass
 
-    def request(self, op: int, body: bytes = b"", timeout: float | None = None) -> bytes:
+    def request(self, op: int, body: bytes = b"", timeout: float | None = None,
+                expect_handle: int | None = None) -> bytes:
         gap = getattr(self, "gap", 0.0)
         if gap:
             time.sleep(gap)
@@ -148,6 +149,10 @@ class AttClient:
                     continue
                 if pdu[0] == OP_ERROR:
                     if pdu[1] == op:
+                        if (expect_handle is not None and len(pdu) >= 4 and
+                                struct.unpack_from("<H", pdu, 2)[0] != expect_handle):
+                            # 遅れて届いた別ハンドルのエラー。捨てる
+                            continue
                         # Some peers send an application error first and the real
                         # response a moment later; keep listening briefly before giving up.
                         pending_err = AttError(pdu[1], struct.unpack_from("<H", pdu, 2)[0],
@@ -155,11 +160,16 @@ class AttClient:
                         err_deadline = time.monotonic() + 1.0
                     continue
                 if pdu[0] == op + 1:
+                    # 注: Read Response(0x0B)/Read Blob Response(0x0D) に
+                    # ハンドルは含まれないため、ここで照合してはいけない。
                     return pdu
             if pending_err is not None and time.monotonic() >= err_deadline:
                 raise pending_err
         if pending_err is not None:
             raise pending_err
+        # タイムアウト後の遅延応答が次の要求に混ざらないよう、少し吸って捨てる
+        self._pump(0.4)
+        self.rx.clear()
         raise TimeoutError(f"ATT timeout for opcode 0x{op:02x}")
 
     def exchange_mtu(self, mtu: int = 247) -> int:
@@ -211,7 +221,7 @@ class AttClient:
         self.write(cccd_handle, b"\x01\x00" if on else b"\x00\x00")
 
     def read(self, handle: int) -> bytes:
-        rsp = self.request(0x0A, struct.pack("<H", handle))
+        rsp = self.request(0x0A, struct.pack("<H", handle), expect_handle=handle)
         return rsp[1:]
 
     def find_info(self, start: int = 1, end: int = 0xFFFF) -> list[tuple[int, str]]:
